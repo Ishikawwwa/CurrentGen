@@ -1,115 +1,208 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+import tensorflow as tf
+from tensorflow.keras import layers, Model, regularizers
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 import numpy as np
-import os
+import matplotlib.pyplot as plt
 
-
-# Main model for generation with temporal features
-class VAE(nn.Module):
-    def __init__(self, input_dim, hidden_dim, latent_dim, sequence_length):
-        super(VAE, self).__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, latent_dim * 2),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, input_dim),
-        )
-        self.lstm = nn.LSTM(latent_dim, latent_dim, num_layers=2, batch_first=True)
-        self.sequence_length = sequence_length
-
-    def encode(self, x):
-        h = self.encoder(x)
-        mean, logvar = torch.chunk(h, 2, dim=-1)
-        return mean, logvar
-
-    def reparameterize(self, mean, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mean + eps * std
-
-    def decode(self, z):
-        return self.decoder(z)
-
-    def forward(self, x):
-        batch_size, seq_len, h, w = x.size()
-        x = x.view(batch_size * seq_len, -1)
-        mean, logvar = self.encode(x)
-        z = self.reparameterize(mean, logvar)
-        z = z.view(batch_size, seq_len, -1)
-        z, _ = self.lstm(z)
-        z = z.contiguous().view(batch_size * seq_len, -1)
-        x_recon = self.decode(z)
-        x_recon = x_recon.view(batch_size, seq_len, h, w)
-        return x_recon, mean, logvar
-
-
-class OceanCurrentsDataset(Dataset):
-    def __init__(self, data_dir, sequence_length):
-        self.data_dir = data_dir
-        self.sequence_length = sequence_length
-        self.files = sorted([f for f in os.listdir(data_dir) if f.endswith(".npy")])
-
-    def __len__(self):
-        return len(self.files) - self.sequence_length + 1
-
-    def __getitem__(self, idx):
-        frames = [
-            np.load(os.path.join(self.data_dir, self.files[i]))
-            for i in range(idx, idx + self.sequence_length)
+class TemporalVAE(Model):
+    def __init__(self, input_shape, latent_dim=64, filters=32):
+        super(TemporalVAE, self).__init__()
+        self.input_shape_ = input_shape
+        self.latent_dim = latent_dim
+        self.filters = filters
+        
+        self.encoder = self._build_encoder()
+        
+        self.decoder = self._build_decoder()
+        
+        self.total_loss_tracker = tf.keras.metrics.Mean(name="total_loss")
+        self.reconstruction_loss_tracker = tf.keras.metrics.Mean(name="reconstruction_loss")
+        self.kl_loss_tracker = tf.keras.metrics.Mean(name="kl_loss")
+        
+    def _build_encoder(self):
+        encoder_inputs = layers.Input(shape=self.input_shape_)
+        
+        x = layers.ConvLSTM2D(
+            self.filters, (3,3), padding='same',
+            return_sequences=True,
+            kernel_regularizer=regularizers.l2(1e-4)
+        )(encoder_inputs)
+        x = layers.BatchNormalization()(x)
+        
+        x = layers.ConvLSTM2D(
+            self.filters*2, (3,3), padding='same',
+            return_sequences=False
+        )(x)
+        x = layers.BatchNormalization()(x)
+        
+        x = layers.Conv2D(
+            self.filters*4, (3,3), strides=2, padding='same',
+            activation='relu'
+        )(x)
+        x = layers.Conv2D(
+            self.filters*8, (3,3), strides=2, padding='same',
+            activation='relu'
+        )(x)
+        
+        x = layers.Flatten()(x)
+        z_mean = layers.Dense(self.latent_dim, name="z_mean")(x)
+        z_log_var = layers.Dense(self.latent_dim, name="z_log_var")(x)
+        
+        return Model(encoder_inputs, [z_mean, z_log_var], name="encoder")
+    
+    def _build_decoder(self):
+        latent_inputs = layers.Input(shape=(self.latent_dim,))
+        
+        x = layers.Dense(self.filters*8 * (self.input_shape_[1]//4) * (self.input_shape_[2]//4))(latent_inputs)
+        x = layers.Reshape((self.input_shape_[1]//4, self.input_shape_[2]//4, self.filters*8))(x)
+        
+        x = layers.Conv2DTranspose(
+            self.filters*4, (3,3), strides=2, padding='same',
+            activation='relu'
+        )(x)
+        x = layers.Conv2DTranspose(
+            self.filters*2, (3,3), strides=2, padding='same',
+            activation='relu'
+        )(x)
+        
+        x = layers.Lambda(lambda x: tf.expand_dims(x, axis=1))(x)
+        x = layers.Lambda(lambda x: tf.tile(x, [1, self.input_shape_[0], 1, 1, 1]))(x)
+        
+        x = layers.ConvLSTM2D(
+            self.filters*2, (3,3), padding='same',
+            return_sequences=True
+        )(x)
+        x = layers.BatchNormalization()(x)
+        
+        x = layers.ConvLSTM2D(
+            self.filters, (3,3), padding='same',
+            return_sequences=True
+        )(x)
+        x = layers.BatchNormalization()(x)
+        
+        decoder_outputs = layers.TimeDistributed(
+            layers.Conv2D(
+                self.input_shape_[-1], (3,3), padding='same',
+                activation='tanh'
+            )
+        )(x)
+        
+        return Model(latent_inputs, decoder_outputs, name="decoder")
+    
+    @tf.function
+    def sample(self, z_mean, z_log_var):
+        batch = tf.shape(z_mean)[0]
+        dim = tf.shape(z_mean)[1]
+        epsilon = tf.keras.backend.random_normal(shape=(batch, dim))
+        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+    
+    def call(self, inputs):
+        z_mean, z_log_var = self.encoder(inputs)
+        z = self.sample(z_mean, z_log_var)
+        reconstructions = self.decoder(z)
+        return reconstructions
+    
+    def train_step(self, data):
+        if isinstance(data, tuple):
+            data = data[0]
+            
+        with tf.GradientTape() as tape:
+            z_mean, z_log_var = self.encoder(data)
+            z = self.sample(z_mean, z_log_var)
+            reconstructions = self.decoder(z)
+            
+            reconstruction_loss = tf.reduce_mean(
+                tf.reduce_sum(
+                    tf.keras.losses.mse(data, reconstructions),
+                    axis=(1,2,3)
+                )
+            )
+            
+            kl_loss = -0.5 * tf.reduce_mean(
+                tf.reduce_sum(
+                    1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var),
+                    axis=1
+                )
+            )
+            
+            total_loss = reconstruction_loss + kl_loss
+            
+        grads = tape.gradient(total_loss, self.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
+        
+        self.total_loss_tracker.update_state(total_loss)
+        self.reconstruction_loss_tracker.update_state(reconstruction_loss)
+        self.kl_loss_tracker.update_state(kl_loss)
+        
+        return {
+            "loss": self.total_loss_tracker.result(),
+            "reconstruction_loss": self.reconstruction_loss_tracker.result(),
+            "kl_loss": self.kl_loss_tracker.result(),
+        }
+    
+    @property
+    def metrics(self):
+        return [
+            self.total_loss_tracker,
+            self.reconstruction_loss_tracker,
+            self.kl_loss_tracker,
         ]
-        frames = np.stack(frames)
-        return torch.tensor(frames, dtype=torch.float32)
 
+def train_temporal_vae(X_train, X_val, seq_len=10, patch_size=64, channels=1,
+                      latent_dim=64, filters=32, epochs=100, batch_size=8):
+    input_shape = (seq_len, patch_size, patch_size, channels)
+    
+    vae = TemporalVAE(input_shape, latent_dim, filters)
+    vae.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4))
+    
+    callbacks = [
+        EarlyStopping(patience=15, restore_best_weights=True),
+        ReduceLROnPlateau(factor=0.5, patience=5, verbose=1),
+        ModelCheckpoint('temporal_vae_best.keras', save_best_only=True)
+    ]
+    
+    history = vae.fit(
+        X_train,
+        batch_size=batch_size,
+        epochs=epochs,
+        validation_data=(X_val,),
+        callbacks=callbacks,
+        verbose=1
+    )
+    
+    return vae, history
 
-def train_vae(model, dataloader, epochs=10, lr=1e-3):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
-    kl_weight = 0.0
-    kl_weight_increment = 0.01
-    for epoch in range(epochs):
-        total_loss = 0
-        total_recon_loss = 0
-        total_kl_loss = 0
-        for batch in dataloader:
-            optimizer.zero_grad()
-            x_recon, mean, logvar = model(batch)
-            recon_loss = nn.functional.mse_loss(x_recon, batch)
-            kl_loss = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
-            loss = (
-                recon_loss + kl_weight * kl_loss
-            )  # Using dynamic KL weight, because it works slightly better for now
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            total_recon_loss += recon_loss.item()
-            total_kl_loss += kl_loss.item()
-        scheduler.step()
-        kl_weight = min(
-            1.0, kl_weight + kl_weight_increment
-        )  # Increasing KL weight through time
-        avg_loss = total_loss / len(dataloader)
-        avg_recon_loss = total_recon_loss / len(dataloader)
-        avg_kl_loss = total_kl_loss / len(dataloader)
-        print(
-            f"Epoch {epoch + 1}, Loss: {avg_loss:.4f}, Recon Loss: {avg_recon_loss:.4f}, KL Loss: {avg_kl_loss:.4f}, KL Weight: {kl_weight:.2f}"
-        )
-
-
-input_dim = nh * nh  # Grid size for the frames
-hidden_dim = 128
-latent_dim = 64
-sequence_length = 10
-
-model = VAE(input_dim, hidden_dim, latent_dim, sequence_length)
-dataset = OceanCurrentsDataset(output_dir, sequence_length)
-dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-
-train_vae(model, dataloader, epochs=20, lr=1e-3)
+if 'X_train' in locals() and 'X_test' in locals():
+    seq_len = X_train.shape[1]
+    patch_size = X_train.shape[2]
+    channels = X_train.shape[4]
+    
+    vae, history = train_temporal_vae(
+        X_train, X_test,
+        seq_len=seq_len,
+        patch_size=patch_size,
+        channels=channels,
+        latent_dim=64,
+        filters=32,
+        epochs=20,
+        batch_size=8
+    )
+    
+    vae.save('ocean_current_temporal_vae.keras')
+    print("Training completed and model saved!")
+    
+    reconstructions = vae.predict(X_test[:3])
+    plt.figure(figsize=(15, 9))
+    for i in range(3):
+        for j in range(3):
+            plt.subplot(3, 6, i*6 + j + 1)
+            plt.imshow(X_test[i,j,...,0], cmap='Blues', vmin=-1, vmax=1)
+            plt.title(f'Sample {i+1}\nOriginal t={j}')
+            plt.subplot(3, 6, i*6 + j + 4)
+            plt.imshow(reconstructions[i,j,...,0], cmap='Blues', vmin=-1, vmax=1)
+            plt.title(f'Reconstructed t={j}')
+    plt.tight_layout()
+    plt.show()
+    
+else:
+    print("Training data not found by some reason")

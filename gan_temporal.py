@@ -1,104 +1,172 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+import tensorflow as tf
+from tensorflow.keras import layers, Model, Sequential
+from tensorflow.keras.optimizers import Adam
 import numpy as np
-import os
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
+def build_generator(latent_dim, seq_length=9, patch_size=64):
+    noise_input = layers.Input(shape=(latent_dim,))
+    x = layers.Dense(8 * 8 * 256, use_bias=False)(noise_input)
+    x = layers.BatchNormalization()(x)
+    x = layers.LeakyReLU()(x)
+    x = layers.Reshape((8, 8, 256))(x)
+    
+    def create_timestep_model():
+        model = Sequential([
+            layers.Conv2DTranspose(128, (5,5), strides=(2,2), padding='same', use_bias=False),
+            layers.BatchNormalization(),
+            layers.LeakyReLU(),
+            
+            layers.Conv2DTranspose(64, (5,5), strides=(2,2), padding='same', use_bias=False),
+            layers.BatchNormalization(),
+            layers.LeakyReLU(),
+            
+            layers.Conv2DTranspose(32, (5,5), strides=(2,2), padding='same', use_bias=False),
+            layers.BatchNormalization(),
+            layers.LeakyReLU(),
+            
+            layers.Conv2D(1, (5,5), padding='same', activation='tanh')
+        ])
+        return model
+    
+    timestep_models = [create_timestep_model() for _ in range(seq_length)]
+    outputs = [model(x) for model in timestep_models]
+    
+    output_sequence = layers.Concatenate(axis=1)([layers.Reshape((1, patch_size, patch_size, 1))(out) for out in outputs])
+    
+    return Model(noise_input, output_sequence)
 
-# Currently still working on this
-# GAN approach
-class Generator(nn.Module):
-    def __init__(self, noise_dim, hidden_dim, output_dim, sequence_length):
-        super(Generator, self).__init__()
-        self.lstm = nn.LSTM(noise_dim, hidden_dim, num_layers=2, batch_first=True)
-        self.conv_layers = nn.Sequential(
-            nn.Conv1d(hidden_dim, hidden_dim * 2, kernel_size=3, padding=1),
-            nn.BatchNorm1d(hidden_dim * 2),
-            nn.ReLU(),
-            nn.Conv1d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-        )
-        self.fc = nn.Sequential(nn.Linear(hidden_dim, output_dim), nn.Tanh())
-        self.sequence_length = sequence_length
+def build_discriminator(seq_length=9, patch_size=64):
+    model = Sequential([
+        layers.Input(shape=(seq_length, patch_size, patch_size, 1)),
+        
+        layers.Conv3D(32, (3,5,5), strides=(1,2,2), padding='same'),
+        layers.LeakyReLU(),
+        layers.Dropout(0.3),
+        
+        layers.Conv3D(64, (3,5,5), strides=(1,2,2), padding='same'),
+        layers.LeakyReLU(),
+        layers.Dropout(0.3),
+        
+        layers.Conv3D(128, (3,5,5), strides=(1,2,2), padding='same'),
+        layers.LeakyReLU(),
+        layers.Dropout(0.3),
+        
+        layers.Flatten(),
+        layers.Dense(1, activation='sigmoid')
+    ])
+    return model
 
-    def forward(self, z):
-        z, _ = self.lstm(z)
-        z = z.permute(0, 2, 1)
-        z = self.conv_layers(z)
-        z = z.permute(0, 2, 1)
-        z = z.contiguous().view(-1, z.size(-1))
-        output = self.fc(z)
-        output = output.view(-1, self.sequence_length, output.size(-1))
-        return output
+class TGAN(Model):
+    def __init__(self, generator, discriminator, latent_dim):
+        super(TGAN, self).__init__()
+        self.generator = generator
+        self.discriminator = discriminator
+        self.latent_dim = latent_dim
+        
+    def compile(self, g_optimizer, d_optimizer, loss_fn):
+        super(TGAN, self).compile()
+        self.g_optimizer = g_optimizer
+        self.d_optimizer = d_optimizer
+        self.loss_fn = loss_fn
+        self.g_loss_metric = tf.keras.metrics.Mean(name='g_loss')
+        self.d_loss_metric = tf.keras.metrics.Mean(name='d_loss')
+        
+    @property
+    def metrics(self):
+        return [self.g_loss_metric, self.d_loss_metric]
+        
+    def train_step(self, real_sequences):
+        batch_size = tf.shape(real_sequences)[0]
+        
+        noise = tf.random.normal([batch_size, self.latent_dim])
+        with tf.GradientTape() as d_tape:
+            generated_sequences = self.generator(noise, training=True)
+            real_output = self.discriminator(real_sequences, training=True)
+            fake_output = self.discriminator(generated_sequences, training=True)
+            
+            real_loss = self.loss_fn(tf.ones_like(real_output), real_output)
+            fake_loss = self.loss_fn(tf.zeros_like(fake_output), fake_output)
+            d_loss = (real_loss + fake_loss) / 2
+            
+        d_gradients = d_tape.gradient(d_loss, self.discriminator.trainable_variables)
+        self.d_optimizer.apply_gradients(
+            zip(d_gradients, self.discriminator.trainable_variables))
+        
+        noise = tf.random.normal([batch_size, self.latent_dim])
+        with tf.GradientTape() as g_tape:
+            generated_sequences = self.generator(noise, training=True)
+            fake_output = self.discriminator(generated_sequences, training=True)
+            g_loss = self.loss_fn(tf.ones_like(fake_output), fake_output)
+            
+        g_gradients = g_tape.gradient(g_loss, self.generator.trainable_variables)
+        self.g_optimizer.apply_gradients(
+            zip(g_gradients, self.generator.trainable_variables))
+        
+        self.g_loss_metric.update_state(g_loss)
+        self.d_loss_metric.update_state(d_loss)
+        
+        return {
+            "g_loss": self.g_loss_metric.result(),
+            "d_loss": self.d_loss_metric.result()
+        }
 
-
-class Discriminator(nn.Module):
-    def __init__(self, input_dim, hidden_dim, sequence_length):
-        super(Discriminator, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=2, batch_first=True)
-        self.conv_layers = nn.Sequential(
-            nn.Conv1d(hidden_dim, hidden_dim * 2, kernel_size=3, padding=1),
-            nn.BatchNorm1d(hidden_dim * 2),
-            nn.LeakyReLU(0.2),
-            nn.Conv1d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(hidden_dim),
-            nn.LeakyReLU(0.2),
-        )
-        self.fc = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
-
-    def forward(self, x):
-        x, _ = self.lstm(x)
-        x = x.permute(0, 2, 1)
-        x = self.conv_layers(x)
-        x = x.permute(0, 2, 1)
-        x = x.contiguous().view(-1, x.size(-1))
-        output = self.fc(x)
-        return output.view(-1)
-
-
-def train_gan(generator, discriminator, dataloader, epochs=10, lr=1e-4):
-    criterion = nn.BCELoss()
-    optimizer_g = optim.Adam(generator.parameters(), lr=lr)
-    optimizer_d = optim.Adam(discriminator.parameters(), lr=lr)
+def train_tgan(X_train, epochs=10, batch_size=32, latent_dim=128):
+    generator = build_generator(latent_dim)
+    discriminator = build_discriminator()
+    
+    tgan = TGAN(generator, discriminator, latent_dim)
+    
+    g_optimizer = Adam(learning_rate=1e-4, beta_1=0.5)
+    d_optimizer = Adam(learning_rate=1e-4, beta_1=0.5)
+    loss_fn = tf.keras.losses.BinaryCrossentropy()
+    
+    tgan.compile(g_optimizer, d_optimizer, loss_fn)
+    
+    dataset = tf.data.Dataset.from_tensor_slices(X_train)
+    dataset = dataset.shuffle(buffer_size=1024).batch(batch_size)
+    
     for epoch in range(epochs):
-        for real_sequences in dataloader:
-            batch_size = real_sequences.size(0)
-            real_labels = torch.ones(batch_size)
-            fake_labels = torch.zeros(batch_size)
+        print(f"\nEpoch {epoch+1}/{epochs}")
+        for batch in tqdm(dataset):
+            tgan.train_step(batch)
+        
+        if (epoch + 1) % 10 == 0:
+            generate_and_save_samples(generator, epoch+1, latent_dim)
+    
+    return tgan
 
-            optimizer_d.zero_grad()
-            outputs = discriminator(real_sequences)
-            real_loss = criterion(outputs, real_labels)
-            real_loss.backward()
+def generate_and_save_samples(generator, epoch, latent_dim, n_samples=3):
+    noise = tf.random.normal([n_samples, latent_dim])
+    generated = generator(noise, training=False)
+    
+    plt.figure(figsize=(15, 5*n_samples))
+    for i in range(n_samples):
+        plt.subplot(n_samples, 3, i*3+1)
+        plt.imshow(generated[i,0,...,0], cmap='Blues', vmin=-1, vmax=1)
+        plt.title(f"Sample {i+1}\nFirst Frame")
+        
+        plt.subplot(n_samples, 3, i*3+2)
+        plt.imshow(generated[i,len(generated[i])//2,...,0], cmap='Blues')
+        plt.title("Middle Frame")
+        
+        plt.subplot(n_samples, 3, i*3+3)
+        plt.imshow(generated[i,-1,...,0], cmap='Blues')
+        plt.title(f"Last Frame\nEpoch {epoch}")
+    
+    plt.tight_layout()
+    plt.savefig(f"generated_samples_epoch_{epoch}.png")
+    plt.show()
 
-            noise = torch.randn(batch_size, generator.sequence_length, noise_dim)
-            fake_sequences = generator(noise)
-            outputs = discriminator(fake_sequences.detach())
-            fake_loss = criterion(outputs, fake_labels)
-            fake_loss.backward()
-            optimizer_d.step()
-
-            optimizer_g.zero_grad()
-            outputs = discriminator(fake_sequences)
-            generator_loss = criterion(outputs, real_labels)
-            generator_loss.backward()
-            optimizer_g.step()
-
-        print(
-            f"Epoch {epoch + 1}, D Loss: {real_loss.item() + fake_loss.item()}, G Loss: {generator_loss.item()}"
-        )
-
-
-noise_dim = 100
-hidden_dim = 128
-output_dim = nh * nh
-sequence_length = 10
-
-generator = Generator(noise_dim, hidden_dim, output_dim, sequence_length)
-discriminator = Discriminator(output_dim, hidden_dim, sequence_length)
-dataset = OceanCurrentsDataset(output_dir, sequence_length)
-dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-
-train_gan(generator, discriminator, dataloader, epochs=20, lr=1e-4)
+try:
+    print(f"Training data shape: {X_train.shape}")
+    
+    tgan = train_tgan(X_train, epochs=30, batch_size=32)
+    
+    tgan.generator.save("tgan_generator.h5")
+    tgan.discriminator.save("tgan_discriminator.h5")
+    print("Training completed and models saved!")
+    
+except Exception as e:
+    print(f"Training failed: {str(e)}")
