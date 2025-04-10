@@ -10,6 +10,7 @@ Examples of Generated simulations (global physical patterns are obeyed as it can
 ![ezgif-6596504765ca38](https://github.com/user-attachments/assets/20ba7c62-cf27-4f75-b4cf-648b12773fe1)
 
 Also, this repository contains simulations create using FluidSim Library which are less realistic because of perfect initial conditions. (Dipole initialization)
+
 I included it to this page to make it easier to have some expectations of how liquid usually moves in simplified environment.
 
 ![ezgif-6878e6cb4b4958](https://github.com/user-attachments/assets/222991b7-e22c-4e0e-88fe-74da8f0a5d94)
